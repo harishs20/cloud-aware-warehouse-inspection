@@ -1,0 +1,24 @@
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  // Allow images from the FastAPI backend origin
+  images: {
+    remotePatterns: [
+      {
+        protocol: "http",
+        hostname: "**",
+      },
+      {
+        protocol: "https",
+        hostname: "**",
+      },
+    ],
+  },
+  // Ensure the API URL env var is available at build time for client bundles
+  env: {
+    NEXT_PUBLIC_API_URL:
+      process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000",
+  },
+};
+
+export default nextConfig;
