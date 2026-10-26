@@ -11,6 +11,10 @@ import numpy as np
 import requests
 import json
 import re
+import os
+import uuid
+import boto3
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -47,6 +51,53 @@ RESULT_DIR = BASE_DIR / "results"
 UPLOAD_DIR.mkdir(exist_ok=True)
 RESULT_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
+
+
+# ============================================================
+# OPTIONAL AWS S3 STORAGE
+# ============================================================
+# Set S3_BUCKET_NAME in the environment to enable cloud uploads.
+# AWS credentials are loaded from the AWS CLI profile/credentials file;
+# do not hardcode access keys in this source file.
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+DYNAMODB_TABLE_NAME = os.getenv("DYNAMODB_TABLE_NAME", "WarehouseInspections")
+AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-2")
+s3_client = boto3.client("s3", region_name=AWS_REGION) if S3_BUCKET_NAME else None
+dynamodb_table = boto3.resource("dynamodb", region_name=AWS_REGION).Table(DYNAMODB_TABLE_NAME)
+
+
+def make_dynamodb_safe(value):
+    """Convert floats recursively to Decimal for DynamoDB compatibility."""
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {str(k): make_dynamodb_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [make_dynamodb_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [make_dynamodb_safe(v) for v in value]
+    return value
+
+def upload_to_s3(local_path: Path, object_key: str) -> bool:
+    """Upload a local file to the configured private S3 bucket.
+
+    Cloud upload failures are logged but do not break local inspection.
+    """
+    if s3_client is None or not S3_BUCKET_NAME:
+        return False
+
+    try:
+        s3_client.upload_file(
+            str(local_path),
+            S3_BUCKET_NAME,
+            object_key,
+            ExtraArgs={"ServerSideEncryption": "AES256"},
+        )
+        print(f"Uploaded to S3: s3://{S3_BUCKET_NAME}/{object_key}")
+        return True
+    except Exception as exc:
+        print(f"WARNING: S3 upload failed for {object_key}: {exc}")
+        return False
 
 
 # ============================================================
@@ -774,6 +825,8 @@ async def upload_image(
     print("NEW INSPECTION")
     print("======================================")
 
+    inspection_id = str(uuid.uuid4())
+    s3_uploaded = {}
 
     # ========================================================
     # 1. READ IMAGE (Supports both multipart and raw binary POST)
@@ -828,6 +881,9 @@ async def upload_image(
         raw_path = UPLOAD_DIR / "last_raw_upload.jpg"
         cv2.imwrite(str(raw_path), image)
         print(f"Raw frame saved to: {raw_path} (size: {image.shape[1]}x{image.shape[0]})")
+        s3_uploaded["original"] = upload_to_s3(
+            raw_path, f"inspections/{inspection_id}/original.jpg"
+        )
 
 
     except Exception as e:
@@ -917,6 +973,9 @@ async def upload_image(
     print(
         f"Cropped image saved to: {image_path} (size: {cropped_image.shape[1]}x{cropped_image.shape[0]})"
     )
+    s3_uploaded["cropped"] = upload_to_s3(
+        image_path, f"inspections/{inspection_id}/cropped.jpg"
+    )
 
 
     # ========================================================
@@ -927,6 +986,10 @@ async def upload_image(
 
         detections = run_yolo(
             image_path
+        )
+        annotated_path = RESULT_DIR / "inspection_result.jpg"
+        s3_uploaded["annotated"] = upload_to_s3(
+            annotated_path, f"inspections/{inspection_id}/annotated.jpg"
         )
 
 
@@ -1021,10 +1084,43 @@ async def upload_image(
             comparison,
 
         "result_image":
-            "/results/inspection_result.jpg"
+            "/results/inspection_result.jpg",
+
+        "inspection_id": inspection_id,
+
+        "cloud_storage": {
+            "bucket": S3_BUCKET_NAME if S3_BUCKET_NAME else None,
+            "uploads": s3_uploaded,
+        }
 
     }
 
+
+    # Save a durable inspection record in DynamoDB. A database failure is
+    # logged without hiding the inspection result from the local dashboard.
+    inspection_record = {
+        "inspection_id": inspection_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "overall_status": overall_status,
+        "qr": qr_data,
+        "expected_inventory": expected_inventory,
+        "detected_inventory": detected_inventory,
+        "detections": detections,
+        "comparison": comparison,
+        "result_image": response["result_image"],
+        "s3_bucket": S3_BUCKET_NAME or "",
+        "s3_objects": {
+            name: f"inspections/{inspection_id}/{name}.jpg"
+            for name, uploaded in s3_uploaded.items() if uploaded
+        },
+    }
+    try:
+        dynamodb_table.put_item(Item=make_dynamodb_safe(inspection_record))
+        response["cloud_storage"]["dynamodb"] = "saved"
+        print(f"Saved inspection to DynamoDB: {inspection_id}")
+    except Exception as exc:
+        response["cloud_storage"]["dynamodb"] = "failed"
+        print(f"WARNING: DynamoDB save failed for {inspection_id}: {exc}")
 
     # Cache in global state for frontend auto-sync
     LATEST_INSPECTION["result"] = response

@@ -1,0 +1,10 @@
+# Dataset
+/dataset/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Uploaded inspection images and generated results
+warehouse-backend/uploads/*
+warehouse-backend/results/*
