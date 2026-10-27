@@ -96,17 +96,19 @@ export async function uploadInspection(
   }
 
   if (!response.ok) {
-    const errData = data as { error?: string };
+    // FastAPI raises HTTPException with `detail`, not `error`
+    const errData = data as { detail?: string; error?: string };
     throw new Error(
-      errData?.error ?? `Upload failed with HTTP ${response.status}`
+      errData?.detail ?? errData?.error ?? `Upload failed with HTTP ${response.status}`
     );
   }
 
   const result = data as InspectionResponse;
 
-  if (!result.success) {
-    const errResult = data as { error?: string };
-    throw new Error(errResult?.error ?? "Inspection returned success: false");
+  // Backend sets success: true on every successful inspection
+  if (result.success === false) {
+    const errResult = data as { detail?: string; error?: string };
+    throw new Error(errResult?.detail ?? errResult?.error ?? "Inspection failed.");
   }
 
   return result;

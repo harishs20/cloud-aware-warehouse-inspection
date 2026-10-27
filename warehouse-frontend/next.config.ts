@@ -14,6 +14,7 @@ const nextConfig: NextConfig = {
       },
     ],
   },
+  output: "export",
   // Ensure the API URL env var is available at build time for client bundles
   env: {
     NEXT_PUBLIC_API_URL:

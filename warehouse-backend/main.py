@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, Request
+from fastapi import FastAPI, File, UploadFile, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +18,15 @@ from decimal import Decimal
 from pathlib import Path
 
 
+sns_client = boto3.client(
+    "sns",
+    region_name="ap-southeast-2"
+)
+
+SNS_TOPIC_ARN = (
+    "arn:aws:sns:ap-southeast-2:927161114126:"
+    "WarehouseInspectionAlerts"
+)
 # ============================================================
 # FASTAPI APP
 # ============================================================
@@ -815,325 +824,162 @@ def result_image():
 # ============================================================
 
 @app.post("/api/upload")
-async def upload_image(
-    request: Request,
-    file: Optional[UploadFile] = File(default=None)
-):
-
-    print("")
-    print("======================================")
-    print("NEW INSPECTION")
-    print("======================================")
+async def upload_image(file: Optional[UploadFile] = File(None), request: Request = None):
+    """Inspect an image, persist the results, and notify subscribers via SNS."""
+    global LATEST_INSPECTION
 
     inspection_id = str(uuid.uuid4())
-    s3_uploaded = {}
+    timestamp = datetime.now(timezone.utc).isoformat()
 
-    # ========================================================
-    # 1. READ IMAGE (Supports both multipart and raw binary POST)
-    # ========================================================
+    # Accept either multipart/form-data with a file field or a raw image body.
+    if file is not None:
+        image_bytes = await file.read()
+    elif request is not None:
+        image_bytes = await request.body()
+    else:
+        raise HTTPException(status_code=400, detail="No image provided.")
 
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+
+    image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status_code=400, detail="Invalid image format.")
+
+    original_path = UPLOAD_DIR / f"{inspection_id}_original.jpg"
+    if not cv2.imwrite(str(original_path), image):
+        raise HTTPException(status_code=500, detail="Could not save uploaded image.")
+
+    original_s3_key = f"inspections/{inspection_id}/original.jpg"
+    cropped_s3_key = f"inspections/{inspection_id}/cropped.jpg"
+    annotated_s3_key = f"inspections/{inspection_id}/annotated.jpg"
+
+    cloud_storage = {
+        "s3_original": "not_configured",
+        "s3_cropped": "not_configured",
+        "s3_annotated": "not_configured",
+    }
+    if S3_BUCKET_NAME and s3_client is not None:
+        cloud_storage["s3_original"] = (
+            "saved" if upload_to_s3(original_path, original_s3_key) else "failed"
+        )
+
+    # QR content must contain the expected rack inventory JSON (or a URL to it).
+    qr_data = detect_qr(image)
+    if not qr_data:
+        raise HTTPException(status_code=400, detail="No QR code detected in the image.")
     try:
-        if file is not None:
-            image_bytes = await file.read()
-        else:
-            image_bytes = await request.body()
+        expected_inventory = normalize_inventory(parse_inventory_from_qr(qr_data))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not parse QR inventory data: {exc}")
 
-        if not image_bytes:
-
-            return JSONResponse(
-
-                status_code=400,
-
-                content={
-                    "error":
-                    "Uploaded image is empty."
-                }
-
-            )
-
-
-        # Convert bytes to OpenCV image
-        image_array = np.frombuffer(
-            image_bytes,
-            dtype=np.uint8
-        )
-
-        image = cv2.imdecode(
-            image_array,
-            cv2.IMREAD_COLOR
-        )
-
-
-        if image is None:
-
-            return JSONResponse(
-
-                status_code=400,
-
-                content={
-                    "error":
-                    "Could not decode uploaded image."
-                }
-
-            )
-
-        # Immediately save raw incoming image for visual inspection & diagnosis
-        raw_path = UPLOAD_DIR / "last_raw_upload.jpg"
-        cv2.imwrite(str(raw_path), image)
-        print(f"Raw frame saved to: {raw_path} (size: {image.shape[1]}x{image.shape[0]})")
-        s3_uploaded["original"] = upload_to_s3(
-            raw_path, f"inspections/{inspection_id}/original.jpg"
-        )
-
-
-    except Exception as e:
-
-        return JSONResponse(
-
-            status_code=400,
-
-            content={
-                "error":
-                f"Image processing error: {str(e)}"
-            }
-
-        )
-
-
-    # ========================================================
-    # 2. DETECT QR CODE
-    # ========================================================
-
-    try:
-        qr_data = detect_qr(image)
-
-        # Fallback: check cropped region if not found on full frame
-        if qr_data is None:
-            cropped_candidate = crop_esp_image(image)
-            qr_data = detect_qr(cropped_candidate)
-
-        if qr_data is None:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "error": "No QR code detected in the image."
-                }
-            )
-
-    except Exception as e:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "success": False,
-                "error": f"QR detection failed: {str(e)}"
-            }
-        )
-
-
-    # ========================================================
-    # 3. PARSE EXPECTED INVENTORY FROM QR JSON
-    # ========================================================
-
-    try:
-        expected_inventory_raw = parse_inventory_from_qr(qr_data)
-        expected_inventory = normalize_inventory(expected_inventory_raw)
-
-        print("Expected inventory:")
-        print(expected_inventory)
-
-    except Exception as e:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "success": False,
-                "qr_data": qr_data,
-                "error": f"Could not read inventory from QR: {str(e)}"
-            }
-        )
-
-
-    # ========================================================
-    # 4. CROP IMAGE (ESP_CROP) & SAVE
-    # ========================================================
-
-    # Apply ESP32-CAM cropping (ESP_CROP = 180, 0, 620, 600 from dataset.ipynb)
     cropped_image = crop_esp_image(image)
+    cropped_path = UPLOAD_DIR / f"{inspection_id}_cropped.jpg"
+    if not cv2.imwrite(str(cropped_path), cropped_image):
+        raise HTTPException(status_code=500, detail="Could not save cropped image.")
 
-    image_path = (
-        UPLOAD_DIR /
-        "inspection.jpg"
-    )
+    if S3_BUCKET_NAME and s3_client is not None:
+        cloud_storage["s3_cropped"] = (
+            "saved" if upload_to_s3(cropped_path, cropped_s3_key) else "failed"
+        )
 
-    cv2.imwrite(
-        str(image_path),
-        cropped_image
-    )
-
-    print(
-        f"Cropped image saved to: {image_path} (size: {cropped_image.shape[1]}x{cropped_image.shape[0]})"
-    )
-    s3_uploaded["cropped"] = upload_to_s3(
-        image_path, f"inspections/{inspection_id}/cropped.jpg"
-    )
-
-
-    # ========================================================
-    # 5. RUN YOLO ON CROPPED IMAGE
-    # ========================================================
-
+    # run_yolo writes the annotated image to RESULT_DIR/inspection_result.jpg.
     try:
+        detections = run_yolo(str(cropped_path))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Object detection failed: {exc}")
 
-        detections = run_yolo(
-            image_path
+    detected_inventory = count_detections(detections)
+    comparison = compare_inventory(expected_inventory, detected_inventory)
+    overall_status = (
+        "PASS"
+        if all(
+            item.get("status") == "PASS"
+            for rack_items in comparison.values()
+            for item in rack_items.values()
         )
-        annotated_path = RESULT_DIR / "inspection_result.jpg"
-        s3_uploaded["annotated"] = upload_to_s3(
-            annotated_path, f"inspections/{inspection_id}/annotated.jpg"
-        )
-
-
-    except Exception as e:
-
-        return JSONResponse(
-
-            status_code=500,
-
-            content={
-
-                "success": False,
-
-                "error":
-                f"YOLO inference failed: {str(e)}"
-
-            }
-
-        )
-
-
-    # ========================================================
-    # 6. COUNT DETECTED OBJECTS
-    # ========================================================
-
-    detected_inventory = (
-        count_detections(
-            detections
-        )
+        else "FAIL"
     )
 
+    annotated_path = RESULT_DIR / "inspection_result.jpg"
+    if not annotated_path.exists():
+        raise HTTPException(status_code=500, detail="Annotated result image was not created.")
 
-    print("Detected inventory:")
-    print(detected_inventory)
+    # Keep a per-inspection copy as well as the stable image used by the frontend.
+    per_inspection_annotated = RESULT_DIR / f"{inspection_id}_annotated.jpg"
+    try:
+        per_inspection_annotated.write_bytes(annotated_path.read_bytes())
+    except OSError as exc:
+        print(f"WARNING: Could not copy annotated image: {exc}")
+        per_inspection_annotated = annotated_path
 
-
-    # ========================================================
-    # 7. COMPARE INVENTORY
-    # ========================================================
-
-    comparison = compare_inventory(
-
-        expected_inventory,
-
-        detected_inventory
-
-    )
-
-
-    # ========================================================
-    # 8. OVERALL RESULT
-    # ========================================================
-
-    overall_status = "PASS"
-
-
-    for rack, items in comparison.items():
-
-        for class_name, result in items.items():
-
-            if result["status"] != "PASS":
-
-                overall_status = "FAIL"
-
-
-    # ========================================================
-    # 9. FINAL RESPONSE
-    # ========================================================
+    if S3_BUCKET_NAME and s3_client is not None:
+        cloud_storage["s3_annotated"] = (
+            "saved" if upload_to_s3(per_inspection_annotated, annotated_s3_key) else "failed"
+        )
 
     response = {
-
         "success": True,
-
-        "overall_status": overall_status,
-
-        "qr": {
-
-            "data": qr_data
-
-        },
-
-        "expected_inventory":
-            expected_inventory,
-
-        "detected_inventory":
-            detected_inventory,
-
-        "detections":
-            detections,
-
-        "comparison":
-            comparison,
-
-        "result_image":
-            "/results/inspection_result.jpg",
-
         "inspection_id": inspection_id,
-
-        "cloud_storage": {
-            "bucket": S3_BUCKET_NAME if S3_BUCKET_NAME else None,
-            "uploads": s3_uploaded,
-        }
-
-    }
-
-
-    # Save a durable inspection record in DynamoDB. A database failure is
-    # logged without hiding the inspection result from the local dashboard.
-    inspection_record = {
-        "inspection_id": inspection_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": timestamp,
         "overall_status": overall_status,
-        "qr": qr_data,
+        "qr": {"data": qr_data},
         "expected_inventory": expected_inventory,
         "detected_inventory": detected_inventory,
         "detections": detections,
         "comparison": comparison,
-        "result_image": response["result_image"],
-        "s3_bucket": S3_BUCKET_NAME or "",
-        "s3_objects": {
-            name: f"inspections/{inspection_id}/{name}.jpg"
-            for name, uploaded in s3_uploaded.items() if uploaded
-        },
+        "result_image": f"/results/inspection_result.jpg",
+        "cloud_storage": cloud_storage,
     }
+
+    # DynamoDB does not accept Python float values; convert recursively to Decimal.
+    inspection_record = make_dynamodb_safe({
+        "inspection_id": inspection_id,
+        "timestamp": timestamp,
+        "overall_status": overall_status,
+        "qr_data": qr_data,
+        "expected_inventory": expected_inventory,
+        "detected_inventory": detected_inventory,
+        "detections": detections,
+        "comparison": comparison,
+        "original_image": original_s3_key,
+        "cropped_image": cropped_s3_key,
+        "annotated_image": annotated_s3_key,
+    })
+
     try:
-        dynamodb_table.put_item(Item=make_dynamodb_safe(inspection_record))
+        dynamodb_table.put_item(Item=inspection_record)
         response["cloud_storage"]["dynamodb"] = "saved"
-        print(f"Saved inspection to DynamoDB: {inspection_id}")
     except Exception as exc:
         response["cloud_storage"]["dynamodb"] = "failed"
         print(f"WARNING: DynamoDB save failed for {inspection_id}: {exc}")
 
-    # Cache in global state for frontend auto-sync
-    LATEST_INSPECTION["result"] = response
-    LATEST_INSPECTION["timestamp"] = datetime.now(timezone.utc).isoformat()
+    # Send an email for every completed inspection, whether PASS or FAIL.
+    try:
+        message = (
+            f"Warehouse Inspection Result: {overall_status}\n\n"
+            f"Inspection ID: {inspection_id}\n"
+            f"Timestamp: {timestamp}\n\n"
+            f"Expected Inventory:\n{json.dumps(expected_inventory, indent=2)}\n\n"
+            f"Detected Inventory:\n{json.dumps(detected_inventory, indent=2)}\n\n"
+            f"Comparison:\n{json.dumps(comparison, indent=2)}\n\n"
+            f"Original image S3 key: {original_s3_key}\n"
+            f"Cropped image S3 key: {cropped_s3_key}\n"
+            f"Annotated image S3 key: {annotated_s3_key}\n"
+        )
+        sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=f"Warehouse Inspection: {overall_status}",
+            Message=message,
+        )
+        response["cloud_storage"]["sns"] = "sent"
+        print(f"SNS notification sent for {inspection_id} ({overall_status})")
+    except Exception as exc:
+        response["cloud_storage"]["sns"] = "failed"
+        print(f"WARNING: SNS notification failed for {inspection_id}: {exc}")
 
-    print("======================================")
-    print(
-        f"INSPECTION RESULT: {overall_status}"
-    )
-    print("======================================")
-    print("")
-
-
+    LATEST_INSPECTION = {"result": response, "timestamp": timestamp}
+    print(f"Inspection {inspection_id} completed: {overall_status}")
     return response
 
 
