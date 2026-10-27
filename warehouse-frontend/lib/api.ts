@@ -12,9 +12,9 @@ function getBaseUrl(): string {
   const url = process.env.NEXT_PUBLIC_API_URL;
   if (!url) {
     console.warn(
-      "[api] NEXT_PUBLIC_API_URL is not set. Falling back to http://3.26.60.152:8000"
+      "[api] NEXT_PUBLIC_API_URL is not set. Falling back to https://finite-expectations-volunteers-vocabulary.trycloudflare.com"
     );
-    return "http://3.26.60.152:8000";
+    return "https://finite-expectations-volunteers-vocabulary.trycloudflare.com";
   }
   return url.replace(/\/$/, ""); // strip trailing slash
 }
