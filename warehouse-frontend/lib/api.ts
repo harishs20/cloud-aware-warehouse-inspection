@@ -12,9 +12,9 @@ function getBaseUrl(): string {
   const url = process.env.NEXT_PUBLIC_API_URL;
   if (!url) {
     console.warn(
-      "[api] NEXT_PUBLIC_API_URL is not set. Falling back to https://department-grant-shades-bargain.trycloudflare.com"
+      "[api] NEXT_PUBLIC_API_URL is not set. Falling back to https://pitch-collar-exclude-chemicals.trycloudflare.com"
     );
-    return "https://department-grant-shades-bargain.trycloudflare.com";
+    return "https://pitch-collar-exclude-chemicals.trycloudflare.com";
   }
   return url.replace(/\/$/, ""); // strip trailing slash
 }
