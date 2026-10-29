@@ -12,9 +12,9 @@ function getBaseUrl(): string {
   const url = process.env.NEXT_PUBLIC_API_URL;
   if (!url) {
     console.warn(
-      "[api] NEXT_PUBLIC_API_URL is not set. Falling back to https://coordinator-tooth-membrane-renew.trycloudflare.com"
+      "[api] NEXT_PUBLIC_API_URL is not set. Falling back to https://islamic-oct-equally-listprice.trycloudflare.com"
     );
-    return "https://coordinator-tooth-membrane-renew.trycloudflare.com";
+    return "https://islamic-oct-equally-listprice.trycloudflare.com";
   }
   return url.replace(/\/$/, ""); // strip trailing slash
 }
