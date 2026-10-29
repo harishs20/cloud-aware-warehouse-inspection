@@ -18,7 +18,7 @@ const nextConfig: NextConfig = {
   // Ensure the API URL env var is available at build time for client bundles
   env: {
     NEXT_PUBLIC_API_URL:
-      process.env.NEXT_PUBLIC_API_URL ?? "https://islamic-oct-equally-listprice.trycloudflare.com",
+      process.env.NEXT_PUBLIC_API_URL ?? "https://demonstration-mortgage-sussex-condo.trycloudflare.com",
   },
 };
 
